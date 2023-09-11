@@ -30,6 +30,7 @@ import (
 	"k8s.io/autoscaler/cluster-autoscaler/core/scaleup"
 	orchestrator "k8s.io/autoscaler/cluster-autoscaler/core/scaleup/orchestrator"
 	"k8s.io/autoscaler/cluster-autoscaler/debuggingsnapshot"
+	kube_util "k8s.io/autoscaler/cluster-autoscaler/utils/kubernetes"
 	"k8s.io/autoscaler/cluster-autoscaler/utils/taints"
 	schedulerframework "k8s.io/kubernetes/pkg/scheduler/framework"
 
@@ -129,19 +130,19 @@ func (callbacks *staticAutoscalerProcessorCallbacks) reset() {
 
 // NewStaticAutoscaler creates an instance of Autoscaler filled with provided parameters
 func NewStaticAutoscaler(
-	opts config.AutoscalingOptions,
-	predicateChecker predicatechecker.PredicateChecker,
-	clusterSnapshot clustersnapshot.ClusterSnapshot,
-	autoscalingKubeClients *context.AutoscalingKubeClients,
-	processors *ca_processors.AutoscalingProcessors,
-	cloudProvider cloudprovider.CloudProvider,
-	expanderStrategy expander.Strategy,
-	estimatorBuilder estimator.EstimatorBuilder,
-	backoff backoff.Backoff,
-	debuggingSnapshotter debuggingsnapshot.DebuggingSnapshotter,
-	remainingPdbTracker pdb.RemainingPdbTracker,
-	scaleUpOrchestrator scaleup.Orchestrator,
-	deleteOptions simulator.NodeDeleteOptions) *StaticAutoscaler {
+		opts config.AutoscalingOptions,
+		predicateChecker predicatechecker.PredicateChecker,
+		clusterSnapshot clustersnapshot.ClusterSnapshot,
+		autoscalingKubeClients *context.AutoscalingKubeClients,
+		processors *ca_processors.AutoscalingProcessors,
+		cloudProvider cloudprovider.CloudProvider,
+		expanderStrategy expander.Strategy,
+		estimatorBuilder estimator.EstimatorBuilder,
+		backoff backoff.Backoff,
+		debuggingSnapshotter debuggingsnapshot.DebuggingSnapshotter,
+		remainingPdbTracker pdb.RemainingPdbTracker,
+		scaleUpOrchestrator scaleup.Orchestrator,
+		deleteOptions simulator.NodeDeleteOptions) *StaticAutoscaler {
 
 	clusterStateConfig := clusterstate.ClusterStateRegistryConfig{
 		MaxTotalUnreadyPercentage: opts.MaxTotalUnreadyPercentage,
@@ -281,7 +282,7 @@ func (a *StaticAutoscaler) RunOnce(currentTime time.Time) caerrors.AutoscalerErr
 	a.DebuggingSnapshotter.StartDataCollection()
 	defer a.DebuggingSnapshotter.Flush()
 
-	scheduledAndUnschedulablePodLister := a.ScheduledAndUnschedulablePodLister()
+	podLister := a.AllPodLister()
 	autoscalingContext := a.AutoscalingContext
 
 	klog.V(4).Info("Starting main loop")
@@ -300,11 +301,12 @@ func (a *StaticAutoscaler) RunOnce(currentTime time.Time) caerrors.AutoscalerErr
 		return err
 	}
 
-	originalScheduledPods, unschedulablePods, err := scheduledAndUnschedulablePodLister.List()
+	pods, err := podLister.List()
 	if err != nil {
-		klog.Errorf("Failed to list scheduled and unschedulable pods: %v", err)
+		klog.Errorf("Failed to list pods: %v", err)
 		return caerrors.ToAutoscalerError(caerrors.ApiCallError, err)
 	}
+	originalScheduledPods, unschedulablePods := kube_util.ScheduledPods(pods), kube_util.UnschedulablePods(pods)
 
 	// Update cluster resource usage metrics
 	coresTotal, memoryTotal := calculateCoresMemoryTotal(allNodes, currentTime)
@@ -610,12 +612,12 @@ func (a *StaticAutoscaler) RunOnce(currentTime time.Time) caerrors.AutoscalerErr
 		metrics.UpdateDurationFromStart(metrics.FindUnneeded, unneededStart)
 
 		scaleDownInCooldown := a.processorCallbacks.disableScaleDownForLoop ||
-			a.lastScaleUpTime.Add(a.ScaleDownDelayAfterAdd).After(currentTime) ||
-			a.lastScaleDownFailTime.Add(a.ScaleDownDelayAfterFailure).After(currentTime) ||
-			a.lastScaleDownDeleteTime.Add(a.ScaleDownDelayAfterDelete).After(currentTime)
+				a.lastScaleUpTime.Add(a.ScaleDownDelayAfterAdd).After(currentTime) ||
+				a.lastScaleDownFailTime.Add(a.ScaleDownDelayAfterFailure).After(currentTime) ||
+				a.lastScaleDownDeleteTime.Add(a.ScaleDownDelayAfterDelete).After(currentTime)
 
 		klog.V(4).Infof("Scale down status: lastScaleUpTime=%s lastScaleDownDeleteTime=%v "+
-			"lastScaleDownFailTime=%s scaleDownForbidden=%v scaleDownInCooldown=%v",
+				"lastScaleDownFailTime=%s scaleDownForbidden=%v scaleDownInCooldown=%v",
 			a.lastScaleUpTime, a.lastScaleDownDeleteTime, a.lastScaleDownFailTime,
 			a.processorCallbacks.disableScaleDownForLoop, scaleDownInCooldown)
 		metrics.UpdateScaleDownInCooldown(scaleDownInCooldown)
@@ -657,8 +659,8 @@ func (a *StaticAutoscaler) RunOnce(currentTime time.Time) caerrors.AutoscalerErr
 			}
 
 			if (scaleDownStatus.Result == scaledownstatus.ScaleDownNoNodeDeleted ||
-				scaleDownStatus.Result == scaledownstatus.ScaleDownNoUnneeded) &&
-				a.AutoscalingContext.AutoscalingOptions.MaxBulkSoftTaintCount != 0 {
+					scaleDownStatus.Result == scaledownstatus.ScaleDownNoUnneeded) &&
+					a.AutoscalingContext.AutoscalingOptions.MaxBulkSoftTaintCount != 0 {
 				taintableNodes := a.scaleDownPlanner.UnneededNodes()
 				untaintableNodes := subtractNodes(allNodes, taintableNodes)
 				actuation.UpdateSoftDeletionTaints(a.AutoscalingContext, taintableNodes, untaintableNodes)
@@ -722,7 +724,7 @@ func fixNodeGroupSize(context *context.AutoscalingContext, clusterStateRegistry 
 
 // Removes unregistered nodes if needed. Returns true if anything was removed and error if such occurred.
 func (a *StaticAutoscaler) removeOldUnregisteredNodes(allUnregisteredNodes []clusterstate.UnregisteredNode, context *context.AutoscalingContext,
-	csr *clusterstate.ClusterStateRegistry, currentTime time.Time, logRecorder *utils.LogEventRecorder) (bool, error) {
+		csr *clusterstate.ClusterStateRegistry, currentTime time.Time, logRecorder *utils.LogEventRecorder) (bool, error) {
 
 	nodeGroups := a.nodeGroupsById()
 	nodesToBeDeletedByNodeGroupId := make(map[string][]clusterstate.UnregisteredNode)
